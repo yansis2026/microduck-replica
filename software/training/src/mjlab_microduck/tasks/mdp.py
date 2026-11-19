@@ -2264,6 +2264,7 @@ def _multistage_target_pose(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg,
     waypoints,
+    progress: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute the time-interpolated joint target across N waypoints.
 
@@ -2272,6 +2273,10 @@ def _multistage_target_pose(
     First waypoint should have frac=0.0 (typically HOME, overrides=None).
     Subsequent waypoints define milestones. Between two waypoints the target
     linearly interpolates. Before the first / after the last it clamps.
+
+    progress: optional (num_envs,) tensor in [0,1]. Defaults to episode
+    progress; pass a command phase to drive the same waypoints from a
+    deployable phase clock.
 
     Returns a (num_envs, num_joints) tensor of target joint angles.
     """
@@ -2285,7 +2290,8 @@ def _multistage_target_pose(
                 pose[:, idx] = val
         return pose
 
-    progress = env.episode_length_buf.float() / float(env.max_episode_length)
+    if progress is None:
+        progress = env.episode_length_buf.float() / float(env.max_episode_length)
     # Find which segment we're in (broadcast over envs).
     out = build_pose(waypoints[0]["overrides"])
     for i in range(1, len(waypoints)):
@@ -2305,12 +2311,14 @@ def _multistage_target_pose(
 def _multistage_target_height(
     env: ManagerBasedRlEnv,
     waypoints,
+    progress: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Same logic as _multistage_target_pose but for trunk z height.
 
     waypoints: [{"frac": float, "height": float}, ...].
     """
-    progress = env.episode_length_buf.float() / float(env.max_episode_length)
+    if progress is None:
+        progress = env.episode_length_buf.float() / float(env.max_episode_length)
     out = torch.full_like(progress, waypoints[0]["height"])
     for i in range(1, len(waypoints)):
         f0 = waypoints[i - 1]["frac"]
@@ -2392,6 +2400,105 @@ def multistage_height_l1_penalty(
         asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
     )
     return -torch.abs(z - target_z)
+
+
+def _phase_from_twist_command(
+    env: ManagerBasedRlEnv, command_name: str = "twist"
+) -> torch.Tensor:
+    """Decode the [cos(2πp), sin(2πp), 0] twist slot back to phase ∈ [0, 1)."""
+    cmd = env.command_manager.get_command(command_name)
+    return (torch.atan2(cmd[:, 1], cmd[:, 0]) / (2 * torch.pi)) % 1.0
+
+
+def split_phase_pose_track(
+    env: ManagerBasedRlEnv,
+    waypoints: list,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    std: float = 0.25,
+    joint_indices: Optional[list] = None,
+) -> torch.Tensor:
+    """Phase-driven N-waypoint pose tracking (deployable clock, not episode progress).
+
+    Same Gaussian-per-joint semantics as multistage_pose_target_match, but the
+    interpolation variable is the task's phase command. After the last waypoint
+    the target clamps, which is how a "reach and hold" skill holds its pose.
+    """
+    asset = env.scene[asset_cfg.name]
+    phase = _phase_from_twist_command(env, command_name)
+    target = _multistage_target_pose(env, asset_cfg, waypoints, progress=phase)
+    joint_pos = _servo_joint_pos(env, asset)
+    if joint_indices is not None:
+        joint_pos = joint_pos[:, joint_indices]
+        target = target[:, joint_indices]
+    return torch.exp(-((joint_pos - target) / std) ** 2).mean(dim=-1)
+
+
+def split_phase_pose_l1_penalty(
+    env: ManagerBasedRlEnv,
+    waypoints: list,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    joint_indices: Optional[list] = None,
+) -> torch.Tensor:
+    """L1 companion to split_phase_pose_track (constant gradient far from target)."""
+    asset = env.scene[asset_cfg.name]
+    phase = _phase_from_twist_command(env, command_name)
+    target = _multistage_target_pose(env, asset_cfg, waypoints, progress=phase)
+    joint_pos = _servo_joint_pos(env, asset)
+    if joint_indices is not None:
+        joint_pos = joint_pos[:, joint_indices]
+        target = target[:, joint_indices]
+    return -torch.abs(joint_pos - target).mean(dim=-1)
+
+
+def split_phase_height_target(
+    env: ManagerBasedRlEnv,
+    waypoints: list,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    std: float = 0.02,
+) -> torch.Tensor:
+    """Phase-driven Gaussian on trunk z."""
+    phase = _phase_from_twist_command(env, command_name)
+    target_z = _multistage_target_height(env, waypoints, progress=phase)
+    asset = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    return torch.exp(-((z - target_z) / std) ** 2)
+
+
+def split_phase_feet_grounded(
+    env: ManagerBasedRlEnv,
+    sensor_name: str,
+    command_name: str = "twist",
+    start_phase: float = 0.35,
+) -> torch.Tensor:
+    """Foot-contact reward that only pays once the split descent has started."""
+    phase = _phase_from_twist_command(env, command_name)
+    gate = (phase >= start_phase).float()
+    return gate * feet_grounded_reward(env, sensor_name)
+
+
+def split_hold_stillness(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    start_phase: float = 0.48,
+    lin_vel_std: float = 0.05,
+    joint_vel_std: float = 1.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward a quiet trunk and joints once the split target has been reached."""
+    phase = _phase_from_twist_command(env, command_name)
+    gate = (phase >= start_phase).float()
+    asset = env.scene[asset_cfg.name]
+    v = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
+    qd = _servo_joint_vel(env, asset)
+    jv = qd.square().mean(dim=-1).sqrt()
+    return gate * torch.exp(-((v / lin_vel_std) ** 2)) * torch.exp(
+        -((jv / joint_vel_std) ** 2)
+    )
 
 
 def pose_target_match(
@@ -7423,4 +7530,17 @@ def balance_nonfoot_contact(env):
     found = env.scene.sensors["nonfoot_ground_contact"].data.found
     if found is None:
         raise ValueError("Balance requires the non-foot ground contact sensor")
+    return (found.reshape(env.num_envs, -1) > 0).any(dim=1)
+
+
+def sensor_contact_termination(env, sensor_name: str) -> torch.Tensor:
+    """Terminate envs where any primary body of ``sensor_name`` touches terrain.
+
+    Generic form of ``balance_nonfoot_contact``: the sensor's ``found`` field is
+    flattened per env and reduced to one bool per env.
+    """
+    sensor = env.scene.sensors[sensor_name]
+    found = getattr(sensor.data, "found", None)
+    if found is None:
+        raise ValueError(f"Sensor {sensor_name!r} does not expose contact 'found'")
     return (found.reshape(env.num_envs, -1) > 0).any(dim=1)

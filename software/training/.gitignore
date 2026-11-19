@@ -34,6 +34,8 @@ claude_experiments/
 
 backup_onnx/
 
+# Local simulation previews (preview_split_sim.py).
+out/
 
 logdir/.claude/
 logdir/

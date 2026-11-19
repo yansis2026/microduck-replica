@@ -76,12 +76,25 @@ from .microduck_balance_env_cfg import (
     MicroduckBalanceRlCfg,
     make_microduck_balance_env_cfg,
 )
+from .microduck_splits_env_cfg import (
+    MicroduckSplitsRlCfg,
+    make_microduck_splits_env_cfg,
+)
 
 register_mjlab_task(
     task_id="Mjlab-Balance-Flat-MicroDuck-HD1910",
     env_cfg=make_microduck_balance_env_cfg(),
     play_env_cfg=make_microduck_balance_env_cfg(play=True),
     rl_cfg=MicroduckBalanceRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front split (left leg forward) — standing -> twist -> press -> split & hold.
+register_mjlab_task(
+    task_id="Mjlab-Splits-Flat-MicroDuck-HD1910",
+    env_cfg=make_microduck_splits_env_cfg(),
+    play_env_cfg=make_microduck_splits_env_cfg(play=True),
+    rl_cfg=MicroduckSplitsRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

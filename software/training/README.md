@@ -34,12 +34,14 @@ uv run --frozen train Mjlab-Velocity-Flat-MicroDuck-HD1910 \
 |---|---|
 | `Mjlab-Velocity-Flat-MicroDuck-HD1910` | HD1910 平地速度任务 |
 | `Mjlab-Velocity-Rough-MicroDuck-HD1910` | HD1910 地形速度任务 |
+| `Mjlab-Splits-Flat-MicroDuck-HD1910` | 劈叉（左腿在前）技能训练，见 [docs/splits-task.md](docs/splits-task.md) |
 
 当前是仿真接入基线，尚无本机实测通过的走路策略。质量惯量仍沿用原版 Microduck
 仿真值；后续需要结合飞特实机校正，并核对零位、方向、限位、供电、IMU 和通信时序。
 
 ## 说明与测试
 
+- [云端训练教程](docs/cloud-training.md)：HF Jobs / 优云智算 / RunPod 的方案、命令与费用估算。
 - [使用说明、验证记录与初始化问题解释](docs/hd1910-baseline.md)：缺失的是飞特控制器的目标角度历史，修复不改变借用的 M6 参数。
 - [来源、固定版本与许可证范围](UPSTREAM.md)。
 - [原训练项目 README](README.upstream.md)：保留上游任务和工具说明，其中默认任务面向 XL330；飞特版使用上表的 HD1910 入口。
@@ -50,8 +52,12 @@ uv run --frozen train Mjlab-Velocity-Flat-MicroDuck-HD1910 \
 uv run --frozen --with pytest python -m pytest -q \
   tests/test_hd1910_cfg.py tests/test_hd1910_rollout.py \
   tests/test_ground_pick_cfg.py tests/test_nan_guard.py tests/test_obs_nan_guard.py \
-  tests/test_hf_source_snapshot.py
+  tests/test_hf_source_snapshot.py \
+  tests/test_splits_cfg.py tests/test_split_geometry.py
 ```
+
+劈叉关键帧的纯 CPU 检查可以单独运行：`python scripts/check_split_pose.py`。
+本地动图预览（无需训练栈）：`python scripts/preview_split_sim.py --mode kinematic --out out/split_preview`。
 
 策略导出沿用 `scripts/export.py`，把观测归一化包含在 ONNX 中。短训练检查点只用于
 验证流程，不作为实机步态发布。
