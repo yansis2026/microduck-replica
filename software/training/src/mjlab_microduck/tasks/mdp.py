@@ -2485,13 +2485,21 @@ def split_hold_stillness(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
     start_phase: float = 0.48,
+    end_phase: float | None = None,
     lin_vel_std: float = 0.05,
     joint_vel_std: float = 1.5,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward a quiet trunk and joints once the split target has been reached."""
+    """Reward a quiet trunk and joints while the phase is in a hold window.
+
+    ``end_phase=None`` keeps the original open-ended gate (split task). Passing
+    ``end_phase`` restricts it to ``[start_phase, end_phase)`` so a showcase can
+    reward stillness during the held split without also rewarding the return.
+    """
     phase = _phase_from_twist_command(env, command_name)
     gate = (phase >= start_phase).float()
+    if end_phase is not None:
+        gate = gate * (phase < end_phase).float()
     asset = env.scene[asset_cfg.name]
     v = torch.nan_to_num(asset.data.root_link_lin_vel_w, nan=0.0).norm(dim=-1)
     qd = _servo_joint_vel(env, asset)
@@ -2499,6 +2507,32 @@ def split_hold_stillness(
     return gate * torch.exp(-((v / lin_vel_std) ** 2)) * torch.exp(
         -((jv / joint_vel_std) ** 2)
     )
+
+
+def split_phase_rise_bootstrap(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    start_phase: float = 0.55,
+    end_phase: float = 0.80,
+    max_height: float = 0.12,
+    max_vz: float | None = 0.08,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward upward trunk velocity during the return-to-stand window.
+
+    Standing up from a full split is the hardest segment, so give an early
+    nonzero gradient. The phase window keeps it off the descent and the held
+    split; the height gate stops paying once standing; ``max_vz`` caps the
+    per-step payoff so a smooth rise is optimal (no bounce incentive).
+    """
+    phase = _phase_from_twist_command(env, command_name)
+    gate = ((phase >= start_phase) & (phase < end_phase)).float()
+    asset = env.scene[asset_cfg.name]
+    com_z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    vz = torch.nan_to_num(asset.data.root_link_lin_vel_w[:, 2], nan=0.0)
+    return gate * (com_z < max_height).float() * torch.clamp(vz, min=0.0, max=max_vz)
 
 
 def pose_target_match(

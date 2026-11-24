@@ -14,6 +14,8 @@ Outputs an animated GIF and a labelled filmstrip PNG (Pillow only).
 Usage (from ``software/training``):
     python scripts/preview_split_sim.py --mode kinematic --out out/split
     python scripts/preview_split_sim.py --mode pd --out out/split_pd
+    python scripts/preview_split_sim.py --mode kinematic --timeline show --out out/show
+    python scripts/preview_split_sim.py --mode kinematic --timeline dance --out out/dance
 """
 
 from __future__ import annotations
@@ -29,9 +31,7 @@ from PIL import Image, ImageDraw
 
 TRAINING = Path(__file__).resolve().parents[1]
 SCENE = TRAINING / "src" / "mjlab_microduck" / "robot" / "microduck" / "scene.xml"
-KEYFRAMES = (
-    TRAINING / "src" / "mjlab_microduck" / "tasks" / "splits_keyframes.py"
-)
+KEYFRAMES_DIR = TRAINING / "src" / "mjlab_microduck" / "tasks"
 
 WIDTH, HEIGHT = 640, 480
 RENDER_FPS = 25
@@ -44,8 +44,13 @@ DEFAULT_KV = 0.08
 DEFAULT_TORQUE = 1.2
 
 
-def load_keyframes():
-    spec = importlib.util.spec_from_file_location("splits_keyframes", KEYFRAMES)
+def keyframes_path(timeline: str) -> Path:
+    name = "dance_keyframes.py" if timeline == "dance" else "splits_keyframes.py"
+    return KEYFRAMES_DIR / name
+
+
+def load_keyframes(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -59,12 +64,12 @@ def _full_pose(stand_pose: dict, pose: dict) -> dict:
     return out
 
 
-def joint_targets(kf, phase: float, stand_pose: dict) -> dict:
+def joint_targets(kf, phase: float, stand_pose: dict, waypoints) -> dict:
     """Interpolate the phase waypoints; clamps outside the first/last."""
-    target = _full_pose(stand_pose, kf.POSE_WAYPOINTS[0][1])
-    for i in range(1, len(kf.POSE_WAYPOINTS)):
-        f0, p0 = kf.POSE_WAYPOINTS[i - 1]
-        f1, p1 = kf.POSE_WAYPOINTS[i]
+    target = _full_pose(stand_pose, waypoints[0][1])
+    for i in range(1, len(waypoints)):
+        f0, p0 = waypoints[i - 1]
+        f1, p1 = waypoints[i]
         if phase <= f0:
             continue
         tau = min(max((phase - f0) / max(f1 - f0, 1e-6), 0.0), 1.0)
@@ -74,17 +79,17 @@ def joint_targets(kf, phase: float, stand_pose: dict) -> dict:
     return target
 
 
-def trunk_height(kf, phase: float) -> float:
-    heights = kf.HEIGHT_WAYPOINTS
-    z = heights[0][1]
-    for i in range(1, len(heights)):
-        f0, z0 = heights[i - 1]
-        f1, z1 = heights[i]
+def interp_value(phase: float, points) -> float:
+    """Piecewise-linear interpolation of scalar ``(frac, value)`` points."""
+    value = points[0][1]
+    for i in range(1, len(points)):
+        f0, v0 = points[i - 1]
+        f1, v1 = points[i]
         if phase <= f0:
             continue
         tau = min(max((phase - f0) / max(f1 - f0, 1e-6), 0.0), 1.0)
-        z = z0 * (1.0 - tau) + z1 * tau
-    return z
+        value = v0 * (1.0 - tau) + v1 * tau
+    return value
 
 
 def stand_pose(model, kf) -> dict[str, float]:
@@ -105,14 +110,33 @@ def apply_targets(model, data, target: dict[str, float], z: float | None = None)
         data.qpos[2] = z
 
 
-def make_camera() -> mujoco.MjvCamera:
+def make_camera(timeline: str = "split") -> mujoco.MjvCamera:
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-    cam.lookat[:] = [0.0, 0.0, 0.08]
-    cam.distance = 0.42
-    cam.azimuth = 90.0  # side view: the split spreads along +x/-x
-    cam.elevation = -8.0
+    if timeline == "dance":
+        # Near-front view: the weight shift sways along y, hidden from the side.
+        cam.lookat[:] = [0.0, 0.0, 0.09]
+        cam.distance = 0.45
+        cam.azimuth = 160.0
+        cam.elevation = -6.0
+    else:
+        cam.lookat[:] = [0.0, 0.0, 0.08]
+        cam.distance = 0.42
+        cam.azimuth = 90.0  # side view: the split spreads along +x/-x
+        cam.elevation = -8.0
     return cam
+
+
+def set_frame(model, data, target, roll: float, z: float) -> None:
+    """Set the full kinematic pose: base xy=0, base roll, joints, height."""
+    data.qpos[:] = model.qpos0
+    data.qpos[0:3] = [0.0, 0.0, z]
+    half = 0.5 * roll
+    data.qpos[3:7] = [math.cos(half), math.sin(half), 0.0, 0.0]  # roll about world x
+    for name, value in target.items():
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        data.qpos[model.jnt_qposadr[jid]] = value
+    mujoco.mj_forward(model, data)
 
 
 def tune_actuators(model, kp, kv, torque) -> None:
@@ -142,11 +166,23 @@ def contact_summary(model, data) -> str:
 
 
 def run(args) -> None:
-    kf = load_keyframes()
+    kf = load_keyframes(keyframes_path(args.timeline))
     model = mujoco.MjModel.from_xml_path(str(SCENE))
     data = mujoco.MjData(model)
     model.opt.timestep = CONTROL_DT / SUBSTEPS
     stand = stand_pose(model, kf)
+    cyclic = args.timeline == "dance"
+    roll_wps = None
+    if args.timeline == "show":
+        pose_wps = kf.SHOW_POSE_WAYPOINTS
+        height_wps = kf.SHOW_HEIGHT_WAYPOINTS
+    elif args.timeline == "dance":
+        pose_wps = kf.DANCE_POSE_WAYPOINTS
+        height_wps = kf.DANCE_HEIGHT_WAYPOINTS
+        roll_wps = kf.DANCE_BASE_ROLL_WAYPOINTS
+    else:
+        pose_wps = kf.POSE_WAYPOINTS
+        height_wps = kf.HEIGHT_WAYPOINTS
     if args.mode == "pd":
         tune_actuators(model, args.kp, args.kv, args.torque)
 
@@ -161,7 +197,7 @@ def run(args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     renderer = None
-    cam = make_camera()
+    cam = make_camera(args.timeline)
     frames = []
     marks = []
 
@@ -178,13 +214,26 @@ def run(args) -> None:
 
     for step in range(total_steps + 1):
         t = step * CONTROL_DT
-        phase = 0.0 if step < settle_steps else (t - args.settle) / args.period
-        target = joint_targets(kf, min(phase, 1.0), stand)
-        z = trunk_height(kf, min(phase, 1.0))
+        if step < settle_steps:
+            phase = 0.0
+        else:
+            raw = (t - args.settle) / args.period
+            # The dance cycles: wrap around. The one-way split/show clamp and
+            # hold the last pose instead.
+            phase = (raw % 1.0) if cyclic else min(raw, 1.0)
+        target = joint_targets(kf, phase, stand, pose_wps)
+        z = interp_value(phase, height_wps)
 
         if args.mode == "kinematic":
-            apply_targets(model, data, target, z)
-            mujoco.mj_forward(model, data)
+            if cyclic:
+                # Dance: the leg joints are pre-solved so the soles stay flat and
+                # planted while the base rolls to sink one hip. The base roll and
+                # height come straight from the stored waypoints.
+                roll = interp_value(phase, roll_wps)
+                set_frame(model, data, target, roll, z)
+            else:
+                apply_targets(model, data, target, z)
+                mujoco.mj_forward(model, data)
         else:
             for name in kf.JOINT_ORDER:
                 aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
@@ -215,7 +264,7 @@ def run(args) -> None:
     if not frames:
         raise SystemExit("no frames rendered")
 
-    gif_path = out_dir / f"split_{args.mode}.gif"
+    gif_path = out_dir / f"{args.timeline}_{args.mode}.gif"
     frames[0].save(
         gif_path,
         save_all=True,
@@ -237,7 +286,7 @@ def run(args) -> None:
         y = (k // 4) * (thumb_h + 18) + 18
         strip.paste(panel, (x, y))
         draw.text((x + 4, y - 15), f"t={t:.2f}s p={phase:.2f} z={z:.3f}", fill=(230, 230, 230))
-    strip_path = out_dir / f"split_{args.mode}_strip.png"
+    strip_path = out_dir / f"{args.timeline}_{args.mode}_strip.png"
     strip.save(strip_path)
 
     print(f"mode={args.mode} frames={len(frames)} duration={args.duration:.1f}s")
@@ -253,15 +302,35 @@ def run(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("kinematic", "pd"), default="kinematic")
+    parser.add_argument("--timeline", choices=("split", "show", "dance"), default="split",
+                        help="split: one-way split; show: split/hold/return; "
+                             "dance: cyclic alternating weight shift")
     parser.add_argument("--out", default="out/split_preview")
-    parser.add_argument("--duration", type=float, default=8.0)
-    parser.add_argument("--period", type=float, default=9.0)
+    parser.add_argument("--duration", type=float, default=None,
+                        help="defaults to the timeline's episode length")
+    parser.add_argument("--period", type=float, default=None,
+                        help="defaults to the timeline's phase period")
     parser.add_argument("--settle", type=float, default=0.5)
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--kp", type=float, default=DEFAULT_KP)
     parser.add_argument("--kv", type=float, default=DEFAULT_KV)
     parser.add_argument("--torque", type=float, default=DEFAULT_TORQUE)
     args = parser.parse_args()
+    if args.duration is None or args.period is None:
+        kf = load_keyframes(keyframes_path(args.timeline))
+        if args.timeline == "show":
+            default_duration = kf.SHOW_EPISODE_LENGTH_S
+            default_period = kf.SHOW_PERIOD_S
+        elif args.timeline == "dance":
+            default_duration = kf.DANCE_EPISODE_LENGTH_S
+            default_period = kf.DANCE_PERIOD_S
+        else:
+            default_duration = 8.0
+            default_period = 9.0
+        if args.duration is None:
+            args.duration = default_duration
+        if args.period is None:
+            args.period = default_period
     run(args)
 
 

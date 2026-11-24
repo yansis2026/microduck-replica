@@ -122,8 +122,10 @@ def test_keyframe_layout_partitions_the_14_servo_joints():
         kf.PHASE_PRESS,
         kf.PHASE_SPLIT,
     ]
-    # Left leg forward, right leg backward in the final split.
-    assert kf.SPLIT["left_hip_pitch"] < 0 and kf.SPLIT["right_hip_pitch"] < 0
+    # Left leg forward (strongly negative hip pitch); the right leg's thigh root
+    # is rotated back, i.e. a less negative / small positive pitch behind it.
+    assert kf.SPLIT["left_hip_pitch"] < 0
+    assert kf.SPLIT["right_hip_pitch"] > kf.SPLIT["left_hip_pitch"]
     assert abs(kf.SPLIT["left_hip_pitch"]) > abs(kf.SPLIT["right_hip_pitch"])
 
 

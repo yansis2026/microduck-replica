@@ -22,7 +22,7 @@ def _load_checker():
 @pytest.fixture(scope="module")
 def rig():
     checker = _load_checker()
-    keyframes = checker.load_keyframes()
+    keyframes = checker.load_keyframes(checker.keyframes_path("split"))
     model = mujoco.MjModel.from_xml_path(str(checker.SCENE))
     data = mujoco.MjData(model)
     key = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "STAND")
@@ -74,6 +74,27 @@ def test_both_feet_are_down_at_each_waypoint(rig, index):
     lows = _pose(rig, frac)
     assert abs(lows["foot_left"]) < 0.004
     assert abs(lows["foot_right"]) < 0.004
+
+
+def test_show_timeline_reuses_only_the_verified_poses(rig):
+    keyframes = rig[1]
+    verified = {
+        id(keyframes.STAND),
+        id(keyframes.TWIST),
+        id(keyframes.PRESS),
+        id(keyframes.SPLIT),
+    }
+    # The showcase must introduce no new geometry: every waypoint is one of the
+    # four poses already validated above.
+    for _, pose in keyframes.SHOW_POSE_WAYPOINTS:
+        assert id(pose) in verified
+    # And it only reuses the validated trunk heights.
+    assert {height for _, height in keyframes.SHOW_HEIGHT_WAYPOINTS} <= {
+        0.115,
+        0.114,
+        0.095,
+        0.063,
+    }
 
 
 def test_final_split_has_left_forward_right_back_and_shin_contact(rig):

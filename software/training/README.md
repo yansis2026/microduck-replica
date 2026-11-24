@@ -35,6 +35,8 @@ uv run --frozen train Mjlab-Velocity-Flat-MicroDuck-HD1910 \
 | `Mjlab-Velocity-Flat-MicroDuck-HD1910` | HD1910 平地速度任务 |
 | `Mjlab-Velocity-Rough-MicroDuck-HD1910` | HD1910 地形速度任务 |
 | `Mjlab-Splits-Flat-MicroDuck-HD1910` | 劈叉（左腿在前）技能训练，见 [docs/splits-task.md](docs/splits-task.md) |
+| `Mjlab-SplitsShow-Flat-MicroDuck-HD1910` | 劈叉展示：劈叉保持 5 s 后原路起身站稳，见 [docs/splits-show-task.md](docs/splits-show-task.md) |
+| `Mjlab-Dance-Flat-MicroDuck-HD1910` | 原地跳舞：上下明显起伏（双膝小蹲、承重膝屈得更狠），左右交替律动、头大幅摆动，脚掌贴地不动、中间回站立，见 [docs/dance-task.md](docs/dance-task.md) |
 
 当前是仿真接入基线，尚无本机实测通过的走路策略。质量惯量仍沿用原版 Microduck
 仿真值；后续需要结合飞特实机校正，并核对零位、方向、限位、供电、IMU 和通信时序。
@@ -53,11 +55,15 @@ uv run --frozen --with pytest python -m pytest -q \
   tests/test_hd1910_cfg.py tests/test_hd1910_rollout.py \
   tests/test_ground_pick_cfg.py tests/test_nan_guard.py tests/test_obs_nan_guard.py \
   tests/test_hf_source_snapshot.py \
-  tests/test_splits_cfg.py tests/test_split_geometry.py
+  tests/test_splits_cfg.py tests/test_splits_show_cfg.py tests/test_split_geometry.py \
+  tests/test_dance_cfg.py tests/test_dance_geometry.py
 ```
 
-劈叉关键帧的纯 CPU 检查可以单独运行：`python scripts/check_split_pose.py`。
-本地动图预览（无需训练栈）：`python scripts/preview_split_sim.py --mode kinematic --out out/split_preview`。
+劈叉/跳舞关键帧的纯 CPU 检查可以单独运行：
+`python scripts/check_split_pose.py`（展示时间线加 `--timeline show`，跳舞加 `--timeline dance`）。
+本地动图预览（无需训练栈）：
+`python scripts/preview_split_sim.py --mode kinematic --out out/split_preview`
+（展示时间线加 `--timeline show`，跳舞加 `--timeline dance`）。
 
 策略导出沿用 `scripts/export.py`，把观测归一化包含在 ONNX 中。短训练检查点只用于
 验证流程，不作为实机步态发布。

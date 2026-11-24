@@ -8,6 +8,8 @@ kinematic feasibility check referenced by ``splits_keyframes.py``.
 Usage:
     python scripts/check_split_pose.py
     python scripts/check_split_pose.py --render out/   # needs a GL backend
+    python scripts/check_split_pose.py --timeline show
+    python scripts/check_split_pose.py --timeline dance
 
 Exit code is non-zero if the trunk or head touches the floor at any waypoint,
 or if a foot is more than 3 mm above/below the floor at the SPLIT waypoint.
@@ -24,7 +26,7 @@ import mujoco
 import numpy as np
 
 TRAINING = Path(__file__).resolve().parents[1]
-KEYFRAMES = TRAINING / "src" / "mjlab_microduck" / "tasks" / "splits_keyframes.py"
+KEYFRAMES_DIR = TRAINING / "src" / "mjlab_microduck" / "tasks"
 SCENE = (
     TRAINING
     / "src"
@@ -39,8 +41,13 @@ SHIN_BODIES = ("leg", "leg_2")
 UPPER_BODIES = ("upper_leg_left", "upper_leg_right")
 
 
-def load_keyframes():
-    spec = importlib.util.spec_from_file_location("splits_keyframes", KEYFRAMES)
+def keyframes_path(timeline: str) -> Path:
+    name = "dance_keyframes.py" if timeline == "dance" else "splits_keyframes.py"
+    return KEYFRAMES_DIR / name
+
+
+def load_keyframes(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -86,6 +93,20 @@ def geom_min_z(model: mujoco.MjModel, data: mujoco.MjData, body_ids) -> float:
     return min(lows) if lows else float("nan")
 
 
+def foot_sole_up(model: mujoco.MjModel, data: mujoco.MjData, body_ids) -> float:
+    """Foot sole normal (foot local x) world z-component over the given bodies.
+
+    ~1.0 means the sole lies flat on the floor; a tilted foot (up on edge)
+    reads much lower. Used by the dance check to catch ankle/foot edge-tilting.
+    """
+    values = []
+    for gid in range(model.ngeom):
+        if model.geom_bodyid[gid] not in body_ids:
+            continue
+        values.append(float(data.geom_xmat[gid].reshape(3, 3)[2, 0]))
+    return max(values) if values else float("nan")
+
+
 def ground_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> list[str]:
     out = []
     for i in range(data.ncon):
@@ -102,9 +123,16 @@ def ground_contacts(model: mujoco.MjModel, data: mujoco.MjData) -> list[str]:
     return sorted(set(out))
 
 
-def apply_pose(model, data, key_qpos, pose, trunk_z):
+def apply_pose(model, data, key_qpos, pose, trunk_z, base_roll=0.0):
     data.qpos[:] = key_qpos
     data.qpos[2] = trunk_z
+    if base_roll:
+        # Roll the free base about world x. The dance weights shift by rolling
+        # the pelvis while the soles stay flat and planted; the leg joints are
+        # pre-solved so both feet remain level, and in training this base roll
+        # emerges from physics.
+        half = 0.5 * base_roll
+        data.qpos[3:7] = [np.cos(half), np.sin(half), 0.0, 0.0]
     for joint_name, value in pose.items():
         joint_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_JOINT, joint_name
@@ -149,12 +177,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--render", type=Path, default=None,
                         help="directory for one PNG per waypoint")
+    parser.add_argument("--timeline", choices=("split", "show", "dance"), default="split",
+                        help="split: one-way split; show: split/hold/return; "
+                             "dance: cyclic alternating weight shift")
     parser.add_argument("--azimuth", type=float, default=135.0)
     parser.add_argument("--elevation", type=float, default=-12.0)
     parser.add_argument("--distance", type=float, default=0.42)
     args = parser.parse_args()
 
-    kf = load_keyframes()
+    kf = load_keyframes(keyframes_path(args.timeline))
     model = mujoco.MjModel.from_xml_path(str(SCENE))
     data = mujoco.MjData(model)
 
@@ -172,47 +203,109 @@ def main() -> int:
     neck_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "neck")
     body_ids["trunk"] = [trunk_id]
     body_ids["head"] = body_subtree(model, neck_id)
+    foot_body_l = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "ankle_left")]
+    foot_body_r = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "ankle_right")]
 
-    heights = dict(
-        (round(frac, 6), height)
-        for frac, height in ((f, h) for f, h in kf.HEIGHT_WAYPOINTS)
-    )
+    if args.timeline == "show":
+        pose_wps = kf.SHOW_POSE_WAYPOINTS
+        height_wps = kf.SHOW_HEIGHT_WAYPOINTS
+        labels = kf.SHOW_LABELS
+    elif args.timeline == "dance":
+        pose_wps = kf.DANCE_POSE_WAYPOINTS
+        height_wps = kf.DANCE_HEIGHT_WAYPOINTS
+        roll_by_frac = dict(kf.DANCE_BASE_ROLL_WAYPOINTS)
+        labels = kf.DANCE_LABELS
+    else:
+        pose_wps = kf.POSE_WAYPOINTS
+        height_wps = kf.HEIGHT_WAYPOINTS
+        labels = tuple(
+            {
+                kf.PHASE_STAND: "STAND",
+                kf.PHASE_TWIST: "TWIST",
+                kf.PHASE_PRESS: "PRESS",
+                kf.PHASE_SPLIT: "SPLIT",
+            }.get(frac, f"phase {frac:.2f}")
+            for frac, _ in pose_wps
+        )
 
     print(f"model: {SCENE}")
-    print(f"waypoints: {[f for f, _ in kf.POSE_WAYPOINTS]}")
+    print(f"timeline: {args.timeline}")
+    print(f"waypoints: {[f for f, _ in pose_wps]}")
     failures = []
-    for frac, pose in kf.POSE_WAYPOINTS:
-        name = {
-            kf.PHASE_STAND: "STAND",
-            kf.PHASE_TWIST: "TWIST",
-            kf.PHASE_PRESS: "PRESS",
-            kf.PHASE_SPLIT: "SPLIT",
-        }.get(frac, f"phase {frac:.2f}")
-        trunk_z = heights[round(frac, 6)]
-        apply_pose(model, data, key_qpos, pose, trunk_z)
+    ref_foot_xy = None
+    for index, ((frac, pose), (_, trunk_z), name) in enumerate(
+        zip(pose_wps, height_wps, labels)
+    ):
+        if args.timeline == "dance":
+            roll = roll_by_frac[frac]
+            apply_pose(model, data, key_qpos, pose, trunk_z, base_roll=roll)
+            foot_l = geom_min_z(model, data, foot_body_l)
+            foot_r = geom_min_z(model, data, foot_body_r)
+            up_l = foot_sole_up(model, data, foot_body_l)
+            up_r = foot_sole_up(model, data, foot_body_r)
+            xy_l = data.xpos[foot_body_l[0]][:2].copy()
+            xy_r = data.xpos[foot_body_r[0]][:2].copy()
+            if ref_foot_xy is None:
+                ref_foot_xy = (xy_l, xy_r)
+            move = max(np.linalg.norm(xy_l - ref_foot_xy[0]),
+                       np.linalg.norm(xy_r - ref_foot_xy[1]))
+            extra = (f"roll={roll:+.4f} sole_up L/R={up_l:.3f}/{up_r:.3f} "
+                     f"foot_move={move * 1000:.1f}mm  ")
+        else:
+            apply_pose(model, data, key_qpos, pose, trunk_z)
+            foot_l = foot_r = None
+            up_l = up_r = move = 0.0
+            extra = ""
 
         lows = {key: geom_min_z(model, data, ids) for key, ids in body_ids.items()}
         contacts = ground_contacts(model, data)
         print(
-            f"\n{name:5s} phase={frac:.2f} trunk_z={trunk_z:.3f}  "
+            f"\n{name:13s} phase={frac:.4f} {extra}trunk_z={trunk_z:.3f}  "
             f"foot={lows['foot']:+.4f} shin={lows['shin']:+.4f} "
             f"upper={lows['upper']:+.4f} trunk={lows['trunk']:+.4f} "
             f"head={lows['head']:+.4f}"
         )
+        if foot_l is not None:
+            print(f"      feet: left={foot_l:+.4f} right={foot_r:+.4f}")
         print(f"      ground contacts: {contacts or 'none'}")
 
-        if abs(lows["foot"]) > 0.003:
+        if args.timeline == "dance":
+            for side, value in (("left", foot_l), ("right", foot_r)):
+                if abs(value) > 0.003:
+                    failures.append(
+                        f"{name} (phase {frac:.4f}): {side} foot lowest point "
+                        f"{value:+.4f} m (expected within 3 mm of the floor)"
+                    )
+            for side, up in (("left", up_l), ("right", up_r)):
+                if up < 0.99:
+                    failures.append(
+                        f"{name} (phase {frac:.4f}): {side} sole is tilted "
+                        f"(sole normal z {up:.3f}, expected >= 0.99 / flat)"
+                    )
+            if move > 0.006:
+                failures.append(
+                    f"{name} (phase {frac:.4f}): a sole moved {move * 1000:.1f} mm "
+                    "on the floor (expected <= 6 mm; soles should stay planted)"
+                )
+        elif abs(lows["foot"]) > 0.003:
             failures.append(
-                f"{name}: foot lowest point {lows['foot']:+.4f} m "
+                f"{name} (phase {frac:.4f}): foot lowest point {lows['foot']:+.4f} m "
                 "(expected within 3 mm of the floor)"
             )
         if lows["trunk"] <= 0.0:
-            failures.append(f"{name}: trunk touches the floor ({lows['trunk']:+.4f} m)")
+            failures.append(
+                f"{name} (phase {frac:.4f}): trunk touches the floor "
+                f"({lows['trunk']:+.4f} m)"
+            )
         if lows["head"] <= 0.0:
-            failures.append(f"{name}: head touches the floor ({lows['head']:+.4f} m)")
+            failures.append(
+                f"{name} (phase {frac:.4f}): head touches the floor "
+                f"({lows['head']:+.4f} m)"
+            )
 
         if args.render is not None:
-            render(model, data, args.render / f"{name.lower()}.png",
+            safe = "".join(ch if ch.isalnum() else "_" for ch in name.lower())
+            render(model, data, args.render / f"{index:02d}_{safe}.png",
                    args.azimuth, args.elevation, args.distance)
 
     if failures:

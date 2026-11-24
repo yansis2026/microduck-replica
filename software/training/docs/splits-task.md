@@ -5,6 +5,9 @@
 固定 **左腿在前**，从站立依次经过扭腰、下压，最后双腿伸展、脚/小腿着地并保持。
 执行器与其它 HD1910 任务完全一致（`FeetechBamActuatorCfg` + `hd1910/1910_m6.json`）。
 
+> 需要“劈叉 → 保持 5 s → 原路起身站稳”的完整展示，见
+> [splits-show-task.md](splits-show-task.md)（任务 `Mjlab-SplitsShow-Flat-MicroDuck-HD1910`）。
+
 ## 关键帧
 
 关键帧数据在 [splits_keyframes.py](../src/mjlab_microduck/tasks/splits_keyframes.py)：

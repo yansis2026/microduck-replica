@@ -80,6 +80,14 @@ from .microduck_splits_env_cfg import (
     MicroduckSplitsRlCfg,
     make_microduck_splits_env_cfg,
 )
+from .microduck_splits_show_env_cfg import (
+    MicroduckSplitsShowRlCfg,
+    make_microduck_splits_show_env_cfg,
+)
+from .microduck_dance_env_cfg import (
+    MicroduckDanceRlCfg,
+    make_microduck_dance_env_cfg,
+)
 
 register_mjlab_task(
     task_id="Mjlab-Balance-Flat-MicroDuck-HD1910",
@@ -95,6 +103,24 @@ register_mjlab_task(
     env_cfg=make_microduck_splits_env_cfg(),
     play_env_cfg=make_microduck_splits_env_cfg(play=True),
     rl_cfg=MicroduckSplitsRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Front split showcase — split, hold 5 s, retrace to a stable stand.
+register_mjlab_task(
+    task_id="Mjlab-SplitsShow-Flat-MicroDuck-HD1910",
+    env_cfg=make_microduck_splits_show_env_cfg(),
+    play_env_cfg=make_microduck_splits_show_env_cfg(play=True),
+    rl_cfg=MicroduckSplitsShowRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# In-place dance — alternating sink-hip / stretch-leg weight shift, cyclic.
+register_mjlab_task(
+    task_id="Mjlab-Dance-Flat-MicroDuck-HD1910",
+    env_cfg=make_microduck_dance_env_cfg(),
+    play_env_cfg=make_microduck_dance_env_cfg(play=True),
+    rl_cfg=MicroduckDanceRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
